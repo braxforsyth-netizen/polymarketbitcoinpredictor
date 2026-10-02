@@ -47,13 +47,18 @@ cp .env.example .env                                   # optional: edit settings
 btcpredict                 # live dashboard (Ctrl+C to quit)
 btcpredict backtest --days 14   # is the probability model calibrated? (free, ~30s)
 btcpredict news            # latest scored headlines
+btcpredict review          # paper-trading report from what the dashboard recorded
 btcpredict snapshot        # current state as JSON
 btcpredict ask "should I bet this window?"   # AI analyst Q&A (needs ANTHROPIC_API_KEY)
 ```
 
 **Start with `btcpredict backtest`.** If the calibration table shows the model's 70% calls coming true about 70% of the time, the probabilities can be trusted. If they don't, adjust the model before relying on the edge numbers.
 
-The dashboard also logs a snapshot every 5 seconds to `data/snapshots.sqlite` (model P(UP), Polymarket bid/ask, and the signal). After a week or two you can measure whether the suggested bets would actually have made money.
+The dashboard also logs a snapshot every 5 seconds to `data/snapshots.sqlite` (model P(UP), Polymarket bid/ask, and the signal). **Leave it running for a week or two, then run `btcpredict review`.** It looks up how each window resolved (Polymarket's own result, falling back to exchange candles) and reports:
+
+- **the signals' paper P&L:** the first BET in each window at the suggested stake, with win rate, ROI and max drawdown
+- **a MIN_EDGE sweep:** $1 flat-bet ROI at 0%, 2%, 4% … 15% edge thresholds, for tuning `MIN_EDGE`
+- **model vs market accuracy:** Brier scores for the model's P(UP) and for Polymarket's mid-price, overall and by time left. **If the market forecasts better than the model, any positive ROI is probably luck, so don't bet real money.**
 
 ## Cost
 
@@ -76,7 +81,7 @@ The AI analyst is optional and uses the paid Anthropic API. It runs one briefing
 
 ## Known limitations
 
-- **Settlement source.** Polymarket resolves on the Chainlink BTC/USD stream. This tool uses Coinbase or Binance prices, which are usually within a few dollars but can disagree when the price is right at the line. The window open is taken from the exchange's 1-minute candle, so it can differ slightly from Polymarket's displayed "price to beat"; compare them the first few times.
+- **Settlement source.** Polymarket resolves on Chainlink BTC/USD. The dashboard streams that price from Polymarket's free real-time feed (`SETTLEMENT_FEED=chainlink`) and uses it for the current price. It takes the price to beat from the first Chainlink tick of each window. If you start the dashboard mid-window, it uses the exchange's candle open plus the measured Chainlink–exchange gap (shown as "exchange + basis est."). If the Chainlink feed drops, it falls back to the exchange price and says so in the header. Volatility is always measured on the exchange feed. For the first few windows, check the displayed "Open (to beat)" against Polymarket's page.
 - **Fees.** The fee formula is an assumption; set `TAKER_FEE_RATE` (or edit `model/edge.py`) to match Polymarket's live fee schedule.
 - **Fat tails.** The normal model can understate the chance of sudden jumps. The backtest's calibration table shows where it goes wrong.
 - **Access.** Check that Polymarket is legally available where you live.
@@ -87,6 +92,7 @@ The AI analyst is optional and uses the paid Anthropic API. It runs one briefing
 src/btcpredict/
   data/prices.py       Coinbase/Binance candles (REST) + live trades (WebSocket)
   data/polymarket.py   Gamma API market lookup + CLOB order books
+  data/chainlink.py    Chainlink BTC/USD settlement price (Polymarket real-time feed)
   data/news.py         RSS + CryptoPanic, keyword impact scoring
   model/windows.py     15-minute window math and market slugs
   model/volatility.py  candle-seeded EWMA volatility
@@ -97,6 +103,7 @@ src/btcpredict/
   dashboard.py         Rich terminal UI
   recorder.py          SQLite snapshot log
   backtest.py          calibration backtest
+  review.py            paper-trading P&L, MIN_EDGE sweep, model-vs-market Brier
 ```
 
 Run the tests with `pip install -e ".[dev]" && pytest`.

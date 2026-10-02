@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from .config import Settings
-from .data import polymarket, prices
+from .data import chainlink, polymarket, prices
 from .data.news import NewsItem, fetch_news, news_shock
 from .model.edge import Recommendation, recommend
 from .model.probability import Projection, project
@@ -20,6 +20,7 @@ from .model.windows import Window, window_at
 log = logging.getLogger(__name__)
 
 NEWS_SHOCK_VOL_MULTIPLIER = 1.5
+CHAINLINK_FRESH_S = 10.0  # use the settlement feed only while it is this fresh
 
 
 @dataclass
@@ -36,6 +37,8 @@ class Snapshot:
     news: list[NewsItem]
     shock: bool
     status: list[str] = field(default_factory=list)
+    price_source: str = "exchange"
+    open_source: str = "exchange"
 
     def to_dict(self) -> dict:
         """Plain-data view used by the AI agent tools and the recorder."""
@@ -45,7 +48,9 @@ class Snapshot:
             "window": self.window.label(),
             "market_slug": self.window.slug,
             "btc_price": self.price,
+            "btc_price_source": self.price_source,
             "window_open_price": self.open_price,
+            "window_open_source": self.open_source,
             "change_usd": (self.price - self.open_price) if self.price and self.open_price else None,
             "seconds_left": round(self.seconds_left),
             "volatility_annualized": round(self.sigma_annual, 3) if self.sigma_annual else None,
@@ -82,6 +87,12 @@ class Engine:
         self.quote: polymarket.MarketQuote | None = None
         self.quote_ts: float = 0.0
         self.news: list[NewsItem] = []
+        # Chainlink settlement feed
+        self.cl_price: float | None = None
+        self.cl_ts: float = 0.0
+        self.cl_opens: dict[int, float] = {}
+        self.basis: float | None = None  # EWMA of (Chainlink - exchange)
+        self.cl_streaming = False
         self.status: dict[str, str] = {}
 
     # ---------- setup ----------
@@ -106,6 +117,16 @@ class Engine:
             self.open_prices[w.start] = price
         self.price, self.price_ts = price, ts
         self.vol.update(ts, price)
+
+    def on_chainlink(self, ts: float, price: float) -> None:
+        w = window_at(ts)
+        if self.cl_ts and window_at(self.cl_ts).start < w.start and ts - w.start <= 5.0:
+            # First settlement tick of a new window: this is (within a tick) the price to beat.
+            self.cl_opens[w.start] = price
+        if self.price is not None and abs(ts - self.price_ts) < 3.0:
+            diff = price - self.price
+            self.basis = diff if self.basis is None else 0.9 * self.basis + 0.1 * diff
+        self.cl_price, self.cl_ts = price, ts
 
     async def refresh_window(self) -> None:
         w = window_at(time.time())
@@ -149,6 +170,10 @@ class Engine:
     async def run_price_stream(self) -> None:
         await prices.stream_trades(self.s.price_source, self.on_price)
 
+    async def run_chainlink_stream(self) -> None:
+        self.cl_streaming = True
+        await chainlink.stream_chainlink(self.on_chainlink)
+
     async def run_market_loop(self, every_s: float = 2.0) -> None:
         while True:
             await self.refresh_window()
@@ -167,21 +192,36 @@ class Engine:
         await self.refresh_market()
 
     # ---------- output ----------
+    def _price_and_open(self, now: float, w: Window) -> tuple[float | None, str, float | None, str]:
+        """Pick a consistent (price, open) pair, preferring the Chainlink settlement feed."""
+        exch_open = self.open_prices.get(w.start)
+        if self.cl_price is not None and now - self.cl_ts < CHAINLINK_FRESH_S:
+            if w.start in self.cl_opens:
+                return self.cl_price, "chainlink", self.cl_opens[w.start], "chainlink"
+            if exch_open is not None and self.basis is not None:
+                return self.cl_price, "chainlink", exch_open + self.basis, "exchange+basis"
+        return self.price, "exchange", exch_open, "exchange"
+
     def snapshot(self, now: float | None = None) -> Snapshot:
         now = now or time.time()
         w = window_at(now)
-        open_px = self.open_prices.get(w.start)
+        price, price_src, open_px, open_src = self._price_and_open(now, w)
         left = w.seconds_left(now)
         shock = news_shock(self.news, now=now)
         sigma = self.vol.sigma_per_s
         status = list(self.status.values())
         if self.price is not None and now - self.price_ts > 15:
             status.append(f"price is {now - self.price_ts:.0f}s stale")
+        if self.cl_streaming and price_src != "chainlink":
+            if self.cl_price is None or now - self.cl_ts >= CHAINLINK_FRESH_S:
+                status.append("Chainlink feed unavailable: using exchange price")
+            else:
+                status.append("Chainlink connected, calibrating vs exchange: using exchange price")
 
         proj = rec = None
-        if self.price and open_px and sigma:
+        if price and open_px and sigma:
             proj = project(
-                self.price, open_px, sigma, left,
+                price, open_px, sigma, left,
                 vol_multiplier=NEWS_SHOCK_VOL_MULTIPLIER if shock else 1.0,
             )
             quote = self.quote if self.quote and self.quote.market.slug == w.slug else None
@@ -201,13 +241,13 @@ class Engine:
             )
         elif open_px is None:
             status.append("waiting for window open price")
-        if open_px is not None and w.start not in self.confirmed_opens:
+        if open_src == "exchange" and open_px is not None and w.start not in self.confirmed_opens:
             status.append("open price is provisional (first live trade)")
 
         return Snapshot(
             ts=now,
             window=w,
-            price=self.price,
+            price=price,
             open_price=open_px,
             seconds_left=left,
             sigma_annual=annualized(sigma) if sigma else None,
@@ -217,4 +257,6 @@ class Engine:
             news=self.news,
             shock=shock,
             status=status,
+            price_source=price_src,
+            open_source=open_src,
         )

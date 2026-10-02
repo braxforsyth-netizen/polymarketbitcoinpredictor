@@ -37,9 +37,10 @@ def market_panel(s: Snapshot) -> Panel:
     t.add_column()
     change = (s.price - s.open_price) if s.price and s.open_price else None
     style = "green" if change is not None and change >= 0 else "red"
-    t.add_row("BTC", f"[bold]${_fmt(s.price, ',.2f')}[/]")
+    src = {"chainlink": "Chainlink (settles)", "exchange": "exchange", "exchange+basis": "exchange + basis est."}
+    t.add_row("BTC", f"[bold]${_fmt(s.price, ',.2f')}[/] [dim]{src.get(s.price_source, s.price_source)}[/]")
     t.add_row("Window", s.window.label())
-    t.add_row("Open (to beat)", f"${_fmt(s.open_price, ',.2f')}")
+    t.add_row("Open (to beat)", f"${_fmt(s.open_price, ',.2f')} [dim]{src.get(s.open_source, s.open_source)}[/]")
     t.add_row(
         "Change",
         f"[{style}]{_fmt(change, '+,.2f')} ({_fmt(change / s.open_price * 100 if change is not None else None, '+.3f')}%)[/]",
@@ -174,6 +175,7 @@ class Dashboard:
             await self.engine.seed_volatility()
         tasks = [
             asyncio.create_task(self.engine.run_price_stream()),
+            *([asyncio.create_task(self.engine.run_chainlink_stream())] if self.s.settlement_feed else []),
             asyncio.create_task(self.engine.run_market_loop()),
             asyncio.create_task(self.engine.run_news_loop()),
             asyncio.create_task(self._record_loop()),

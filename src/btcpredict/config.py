@@ -27,6 +27,7 @@ def _f(name: str, default: float) -> float:
 @dataclass(frozen=True)
 class Settings:
     price_source: str = "coinbase"
+    settlement_feed: bool = True  # stream Chainlink BTC/USD (what Polymarket settles on)
     anthropic_api_key: str = ""
     claude_model: str = "claude-opus-5-5"
     claude_effort: str = "low"
@@ -49,6 +50,7 @@ def load_settings() -> Settings:
     env = os.environ
     return Settings(
         price_source=env.get("PRICE_SOURCE", "coinbase").lower() or "coinbase",
+        settlement_feed=env.get("SETTLEMENT_FEED", "chainlink").lower() not in ("off", "0", "false", "no"),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY", ""),
         claude_model=env.get("CLAUDE_MODEL", "") or "claude-opus-5-5",
         claude_effort=env.get("CLAUDE_EFFORT", "") or "low",

@@ -13,9 +13,12 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
     ts REAL, window_start INTEGER, price REAL, open_price REAL, seconds_left REAL,
     sigma_annual REAL, p_up REAL, ask_up REAL, ask_down REAL, bid_up REAL, bid_down REAL,
-    action TEXT, stake REAL, news_shock INTEGER
+    action TEXT, stake REAL, news_shock INTEGER, price_source TEXT, open_source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_window ON snapshots(window_start);
+CREATE TABLE IF NOT EXISTS outcomes (
+    window_start INTEGER PRIMARY KEY, outcome INTEGER, source TEXT
+);
 """
 
 
@@ -30,13 +33,14 @@ class Recorder:
             return
         q, r = s.quote, s.recommendation
         self.db.execute(
-            "INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 s.ts, s.window.start, s.price, s.open_price, s.seconds_left, s.sigma_annual,
                 s.projection.p_up if s.projection else None,
                 q.ask_up if q else None, q.ask_down if q else None,
                 q.up.best_bid if q else None, q.down.best_bid if q else None,
                 r.action if r else None, r.stake if r else 0.0, int(s.shock),
+                s.price_source, s.open_source,
             ),
         )
         self.db.commit()

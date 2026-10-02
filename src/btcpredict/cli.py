@@ -121,6 +121,61 @@ def cmd_backtest(args) -> None:
     asyncio.run(main())
 
 
+def cmd_review(args) -> None:
+    import sqlite3
+    from pathlib import Path
+
+    from . import review
+
+    async def main():
+        settings = load_settings()
+        if not Path(settings.db_path).exists():
+            console.print(f"[yellow]No recordings at {settings.db_path} yet. Run the dashboard for a while first.[/]")
+            return
+        db = sqlite3.connect(settings.db_path)
+        rows = review.load_rows(db)
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            outcomes = await review.resolve_outcomes(
+                db, client, {r["window_start"] for r in rows}, settings.price_source
+            )
+        db.close()
+        windows = {r["window_start"] for r in rows if r["window_start"] in outcomes}
+        console.print(f"[bold]{len(rows)}[/] snapshots across [bold]{len(windows)}[/] finished windows\n")
+        if not windows:
+            console.print("[yellow]No finished windows to review yet.[/]")
+            return
+
+        s = review.summarize(review.recorded_trades(rows, outcomes, settings.taker_fee_rate))
+        console.print("[bold]Signals the dashboard showed[/] (first BET per window, suggested stake)")
+        if s.n:
+            pnl_style = "green" if s.pnl >= 0 else "red"
+            console.print(
+                f"  {s.n} bets, won {s.win_rate:.0%}, staked ${s.staked:,.2f}, "
+                f"P&L [{pnl_style}]${s.pnl:+,.2f}[/] (ROI {s.roi:+.1%}), max drawdown ${s.max_drawdown:,.2f}\n"
+            )
+        else:
+            console.print("  No BET signals recorded yet.\n")
+
+        t = Table("Min edge", "Bets", "Win rate", "ROI ($1 flat)", "Max drawdown", title="What if MIN_EDGE were…")
+        for th, sm in review.threshold_sweep(rows, outcomes, settings.taker_fee_rate, min_seconds_left=settings.min_seconds_left):
+            style = "green" if sm.roi > 0 else "red" if sm.n else "dim"
+            t.add_row(f"{th:.0%}", str(sm.n), f"{sm.win_rate:.0%}" if sm.n else "—",
+                      f"[{style}]{sm.roi:+.1%}[/]" if sm.n else "—", f"${sm.max_drawdown:.2f}")
+        console.print(t)
+
+        b = Table("Time left", "Snapshots", "Model Brier", "Market Brier", "Better forecaster", title="Model vs Polymarket accuracy (lower Brier is better)")
+        for row in review.brier_vs_market(rows, outcomes):
+            better = "[green]model[/]" if row.model < row.market else "[red]market[/]"
+            b.add_row(row.label, str(row.n), f"{row.model:.4f}", f"{row.market:.4f}", better)
+        console.print(b)
+        console.print(
+            "[dim]If the market is the better forecaster, positive ROI above is probably luck. "
+            "Collect a few hundred windows before drawing conclusions.[/]"
+        )
+
+    asyncio.run(main())
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="btcpredict", description=__doc__)
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -138,6 +193,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--days", type=float, default=7)
     p.add_argument("--source", choices=["coinbase", "binance"])
     p.set_defaults(func=cmd_backtest)
+    sub.add_parser("review", help="paper-trading report from recorded snapshots").set_defaults(func=cmd_review)
 
     args = parser.parse_args(argv)
     logging.basicConfig(
