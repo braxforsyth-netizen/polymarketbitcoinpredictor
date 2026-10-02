@@ -34,6 +34,8 @@ the keyword scorer under-rated, or a scheduled macro release), but do not turn N
 - Over 15 minutes, most news is noise. Call out only items that could plausibly move BTC within \
 minutes: ETF flows/decisions, exchange hacks or halts, Fed/CPI/jobs data, large liquidations, \
 regulatory actions, stablecoin problems.
+- If signal_validated_by_paper_trading is false, the signal has not yet been shown to beat the \
+market on recorded history: call any BET a paper bet and say not to stake real money yet.
 - This is advisory only. The user places any bets themselves.
 - Be concise and use plain text suited to a terminal panel (no markdown headings or tables)."""
 
@@ -84,7 +86,7 @@ _MARKET_KEYS = (
 _PROJ_KEYS = (
     "seconds_left", "volatility_annualized", "model_p_up", "model_p_up_band",
     "expected_1sigma_move_usd", "edge_per_dollar", "recommendation", "recommendation_reasons",
-    "suggested_stake_usd", "high_impact_news_last_10m",
+    "suggested_stake_usd", "high_impact_news_last_10m", "signal_validated_by_paper_trading",
 )
 _IMPACT_RANK = {"low": 0, "medium": 1, "high": 2}
 

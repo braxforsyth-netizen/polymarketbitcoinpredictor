@@ -41,10 +41,24 @@ pip install -e .
 cp .env.example .env                                   # optional: edit settings
 ```
 
+## What runs automatically
+
+You don't need to run any checks by hand: the dashboard does them in the background and shows the results in the **Health** and **Paper trading** panels.
+
+| Automatic step | What it does | Effect on signals |
+|---|---|---|
+| **Startup checks** | Tests the exchange price (REST and live), Chainlink, the Polymarket market and order book, news feeds and Claude, with a fix for anything that fails | Any required source down → NO BET |
+| **Daily calibration** | Backtests the last 7 days, fits a volatility multiplier so the probabilities are honest, and applies it to the live model (cached in `data/calibration.json`) | Still miscalibrated after tuning (a bin off by more than 6 points) → NO BET |
+| **Data check** | After each window, compares the result implied by our prices with Polymarket's actual resolution | 2+ clear disagreements in the last 20 windows → NO BET |
+| **Paper trading** | Every minute, scores the recorded signals against real outcomes and Polymarket's prices | Signals show as **PAPER BET** until 300 windows are recorded, the model forecasts better than the market, and at least 30 paper bets are profitable |
+
+`btcpredict doctor` runs the same startup checks from the command line. On first run, `.env` is created from `.env.example` automatically.
+
 ## Use
 
 ```bash
 btcpredict                 # live dashboard (Ctrl+C to quit)
+btcpredict doctor          # check every data source, with fixes
 btcpredict backtest --days 14   # is the probability model calibrated? (free, ~30s)
 btcpredict news            # latest scored headlines
 btcpredict review          # paper-trading report from what the dashboard recorded
@@ -52,7 +66,7 @@ btcpredict snapshot        # current state as JSON
 btcpredict ask "should I bet this window?"   # AI analyst Q&A (needs ANTHROPIC_API_KEY)
 ```
 
-**Start with `btcpredict backtest`.** If the calibration table shows the model's 70% calls coming true about 70% of the time, the probabilities can be trusted. If they don't, adjust the model before relying on the edge numbers.
+`btcpredict backtest` shows the full calibration tables behind the dashboard's daily check, plus the volatility multiplier it would apply.
 
 The dashboard also logs a snapshot every 5 seconds to `data/snapshots.sqlite` (model P(UP), Polymarket bid/ask, and the signal). **Leave it running for a week or two, then run `btcpredict review`.** It looks up how each window resolved (Polymarket's own result, falling back to exchange candles) and reports:
 
@@ -102,7 +116,10 @@ src/btcpredict/
   agent.py             Claude analyst with tools over the Snapshot
   dashboard.py         Rich terminal UI
   recorder.py          SQLite snapshot log
-  backtest.py          calibration backtest
+  backtest.py          calibration backtest + volatility multiplier fit
+  calibration.py       daily auto-calibration (cached)
+  health.py            startup checks / `doctor`
+  supervisor.py        background calibration, data check, paper-trading readiness
   review.py            paper-trading P&L, MIN_EDGE sweep, model-vs-market Brier
 ```
 

@@ -20,6 +20,7 @@ from .config import Settings
 from .engine import Engine, Snapshot
 from .model.windows import WINDOW_SECONDS
 from .recorder import Recorder
+from .supervisor import Supervisor
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +86,13 @@ def signal_panel(s: Snapshot, settings: Settings) -> Panel:
         body = Text("Waiting for data…", style="dim")
         return Panel(body, title="Signal", border_style="white")
     color = "green" if rec.action == "BET UP" else "red" if rec.action == "BET DOWN" else "yellow"
-    lines = [Text(rec.action, style=f"bold {color}", justify="center")]
+    is_bet = rec.action.startswith("BET")
+    label = rec.action if (s.validated or not is_bet) else f"PAPER {rec.action}"
+    lines = [Text(label, style=f"bold {color}", justify="center")]
+    if is_bet and not s.validated:
+        lines.append(
+            Text("Not validated yet: track it, don't stake real money (see Paper trading)", style="yellow", justify="center")
+        )
     if rec.stake:
         lines.append(
             Text(
@@ -98,7 +105,7 @@ def signal_panel(s: Snapshot, settings: Settings) -> Panel:
     return Panel(Group(*lines), title="Signal (advisory)", border_style=color)
 
 
-def news_panel(s: Snapshot, rows: int = 14) -> Panel:
+def news_panel(s: Snapshot, rows: int = 10) -> Panel:
     t = Table(box=None, expand=True, show_header=False)
     t.add_column(width=5, justify="right")
     t.add_column(width=2)
@@ -121,7 +128,56 @@ def ai_panel(text: str, enabled: bool, updated: float | None) -> Panel:
     return Panel(body, title="AI analyst", subtitle=sub, border_style="blue")
 
 
-def render(s: Snapshot, settings: Settings, ai_text: str, ai_updated: float | None) -> Layout:
+def _mark(ok: bool | None) -> str:
+    return "[green]✓[/]" if ok else "[dim]…[/]" if ok is None else "[red]✗[/]"
+
+
+def health_panel(sup: Supervisor | None) -> Panel:
+    if sup is None:
+        return Panel(Text("—", style="dim"), title="Health", border_style="green")
+    lines: list[Text] = []
+    if sup.checks is None:
+        lines.append(Text.from_markup("[dim]Checking data sources…[/]"))
+    else:
+        lines.append(Text.from_markup("  ".join(f"{_mark(c.ok)} {c.name}" for c in sup.checks)))
+        for c in sup.checks:
+            if not c.ok:
+                lines.append(Text.from_markup(f"[red]{c.name}:[/] {c.detail}. [dim]{c.fix}[/]"))
+    cal = sup.calibration
+    lines.append(Text.from_markup(f"{_mark(cal.ok if cal else None)} Calibration: {sup.calibration_note}"))
+    dc = sup.data_check
+    lines.append(Text.from_markup(
+        f"{_mark(None if not dc.checked else dc.serious_misses < 2)} Data check: {dc.summary()}"
+    ))
+    return Panel(Group(*lines), title="Health", border_style="green")
+
+
+def paper_panel(sup: Supervisor | None) -> Panel:
+    r = sup.readiness if sup else None
+    if r is None:
+        return Panel(Text("Loading recorded history…", style="dim"), title="Paper trading", border_style="blue")
+    filled = round(20 * min(r.windows, r.target) / r.target)
+    p = r.paper
+    lines: list = [Text.from_markup(
+        f"[green]{'█' * filled}[/][dim]{'░' * (20 - filled)}[/] {r.windows}/{r.target} windows recorded"
+    )]
+    if p.n:
+        style = "green" if p.pnl >= 0 else "red"
+        lines.append(Text.from_markup(
+            f"{p.n} paper bets · won {p.win_rate:.0%} · P&L [{style}]${p.pnl:+,.2f}[/] (ROI {p.roi:+.1%})"
+        ))
+    if r.model_brier is not None:
+        who = "[green]model[/]" if r.model_beats_market else "[red]market[/]"
+        lines.append(Text.from_markup(
+            f"Brier: model {r.model_brier:.4f} vs market {r.market_brier:.4f} → {who} forecasts better"
+        ))
+    lines.append(Text(r.verdict(), style="bold green" if r.validated else "yellow"))
+    return Panel(Group(*lines), title="Paper trading", border_style="green" if r.validated else "blue")
+
+
+def render(
+    s: Snapshot, settings: Settings, ai_text: str, ai_updated: float | None, sup: Supervisor | None = None
+) -> Layout:
     root = Layout()
     status = " | ".join(s.status) if s.status else "all feeds OK"
     header = Text.assemble(
@@ -134,7 +190,11 @@ def render(s: Snapshot, settings: Settings, ai_text: str, ai_updated: float | No
     root["left"].split_column(
         Layout(market_panel(s), size=12), Layout(odds_panel(s), size=7), Layout(signal_panel(s, settings))
     )
-    root["right"].update(news_panel(s))
+    root["right"].split_column(
+        Layout(news_panel(s), name="news"),
+        Layout(health_panel(sup), size=8),
+        Layout(paper_panel(sup), size=7),
+    )
     root["ai"].update(ai_panel(ai_text, settings.ai_enabled, ai_updated))
     return root
 
@@ -145,6 +205,7 @@ class Dashboard:
         self.engine = Engine(settings)
         self.analyst = Analyst(settings, self.engine.snapshot) if settings.ai_enabled else None
         self.recorder = Recorder(settings.db_path)
+        self.supervisor = Supervisor(settings, self.engine, self.recorder.db)
         self.ai_text = ""
         self.ai_updated: float | None = None
         self._briefed: set[tuple[int, str]] = set()
@@ -179,13 +240,16 @@ class Dashboard:
             asyncio.create_task(self.engine.run_market_loop()),
             asyncio.create_task(self.engine.run_news_loop()),
             asyncio.create_task(self._record_loop()),
+            asyncio.create_task(self.supervisor.run_startup_checks()),
+            asyncio.create_task(self.supervisor.calibration_loop()),
+            asyncio.create_task(self.supervisor.validation_loop()),
         ]
         if self.analyst:
             tasks.append(asyncio.create_task(self._ai_loop()))
         try:
             with Live(screen=True, refresh_per_second=4, auto_refresh=False) as live:
                 while True:
-                    live.update(render(self.engine.snapshot(), self.s, self.ai_text, self.ai_updated), refresh=True)
+                    live.update(render(self.engine.snapshot(), self.s, self.ai_text, self.ai_updated, self.supervisor), refresh=True)
                     await asyncio.sleep(0.25)
         finally:
             for t in tasks:

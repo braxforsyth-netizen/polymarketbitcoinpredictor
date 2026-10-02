@@ -153,12 +153,29 @@ def brier_vs_market(rows: Sequence[dict], outcomes: dict[int, int]) -> list[Brie
 # ---------- data access ----------
 
 def load_rows(db: sqlite3.Connection) -> list[dict]:
-    db.row_factory = sqlite3.Row
-    return [dict(r) for r in db.execute("SELECT * FROM snapshots ORDER BY ts")]
+    cur = db.cursor()
+    cur.row_factory = sqlite3.Row
+    return [dict(r) for r in cur.execute("SELECT * FROM snapshots ORDER BY ts")]
+
+
+CANDLE_FALLBACK_AFTER_S = 30 * 60  # give Polymarket this long to resolve before using candles
+
+
+async def polymarket_outcome(client: httpx.AsyncClient, window_start: int) -> int | None:
+    """1/0 once Polymarket has resolved the window's market, else None."""
+    m = await polymarket.find_market(client, Window(window_start, window_start + WINDOW_SECONDS).slug)
+    if m and m.closed and m.up_mid in (0.0, 1.0):
+        return int(m.up_mid == 1.0)
+    return None
 
 
 async def resolve_outcomes(
-    db: sqlite3.Connection, client: httpx.AsyncClient, windows: Iterable[int], price_source: str
+    db: sqlite3.Connection,
+    client: httpx.AsyncClient,
+    windows: Iterable[int],
+    price_source: str,
+    attempts: dict[int, int] | None = None,
+    max_attempts: int = 30,
 ) -> dict[int, int]:
     """Outcome per finished window: cached -> Polymarket's resolution -> exchange candles."""
     db.execute("CREATE TABLE IF NOT EXISTS outcomes (window_start INTEGER PRIMARY KEY, outcome INTEGER, source TEXT)")
@@ -167,14 +184,17 @@ async def resolve_outcomes(
     for w in sorted(set(windows)):
         if w in known or w + WINDOW_SECONDS + 120 > now:
             continue
+        if attempts is not None:
+            if attempts.get(w, 0) >= max_attempts:
+                continue
+            attempts[w] = attempts.get(w, 0) + 1
         outcome, source = None, None
         try:
-            m = await polymarket.find_market(client, Window(w, w + WINDOW_SECONDS).slug)
-            if m and m.closed and m.up_mid in (0.0, 1.0):
-                outcome, source = int(m.up_mid == 1.0), "polymarket"
+            outcome = await polymarket_outcome(client, w)
+            source = "polymarket" if outcome is not None else None
         except httpx.HTTPError:
             pass
-        if outcome is None:
+        if outcome is None and now - (w + WINDOW_SECONDS) > CANDLE_FALLBACK_AFTER_S:
             try:
                 candles = await prices.fetch_candles_1m(client, price_source, w, w + WINDOW_SECONDS)
                 if len(candles) == 15:
@@ -186,3 +206,57 @@ async def resolve_outcomes(
             db.execute("INSERT OR REPLACE INTO outcomes VALUES (?,?,?)", (w, outcome, source))
             db.commit()
     return known
+
+
+# ---------- readiness: is the model good enough to trust its signals? ----------
+
+READY_WINDOWS = 300
+MIN_PAPER_BETS = 30
+
+
+@dataclass(frozen=True)
+class Readiness:
+    windows: int  # finished windows with both model and market data
+    model_brier: float | None
+    market_brier: float | None
+    paper: TradeSummary
+    target: int = READY_WINDOWS
+
+    @property
+    def model_beats_market(self) -> bool:
+        return self.model_brier is not None and self.market_brier is not None and self.model_brier < self.market_brier
+
+    @property
+    def validated(self) -> bool:
+        return (
+            self.windows >= self.target
+            and self.model_beats_market
+            and self.paper.n >= MIN_PAPER_BETS
+            and self.paper.pnl > 0
+        )
+
+    def verdict(self) -> str:
+        if self.windows < self.target:
+            return f"Collecting data: {self.windows}/{self.target} windows. Signals are paper-only until then."
+        if not self.model_beats_market:
+            return "Polymarket's prices forecast better than the model. Don't bet real money; any profit is likely luck."
+        if self.paper.n < MIN_PAPER_BETS:
+            return f"Model beats the market, but only {self.paper.n}/{MIN_PAPER_BETS} paper bets so far."
+        if self.paper.pnl <= 0:
+            return "Model beats the market, but paper bets lost money after fees. Try a higher MIN_EDGE."
+        return "Validated: model beats the market and paper bets are profitable. Keep stakes small."
+
+
+def readiness(rows: Sequence[dict], outcomes: dict[int, int], fee_rate: float, target: int = READY_WINDOWS) -> Readiness:
+    overall = next((b for b in brier_vs_market(rows, outcomes) if b.label == "all"), None)
+    windows = {
+        r["window_start"] for r in rows
+        if r["window_start"] in outcomes and r["p_up"] is not None and r["ask_up"] is not None
+    }
+    return Readiness(
+        windows=len(windows),
+        model_brier=overall.model if overall else None,
+        market_brier=overall.market if overall else None,
+        paper=summarize(recorded_trades(rows, outcomes, fee_rate)),
+        target=target,
+    )

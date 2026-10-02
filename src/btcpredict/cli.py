@@ -118,6 +118,16 @@ def cmd_backtest(args) -> None:
             bm.add_row(str(m), str(n), f"{brier:.4f}")
         console.print(bm)
 
+        from .backtest import fit_vol_multiplier, max_calibration_gap, rescale
+        preds = predict_windows(candles)
+        k = fit_vol_multiplier(preds)
+        tuned = evaluate(rescale(preds, k))
+        console.print(
+            f"\nAuto-tuning: volatility ×{k:.2f} gives Brier {tuned.brier:.4f} "
+            f"(raw {report.brier:.4f}), worst calibration bin off {max_calibration_gap(tuned):.1%}. "
+            "[dim]The dashboard applies this automatically each day.[/]"
+        )
+
     asyncio.run(main())
 
 
@@ -176,6 +186,37 @@ def cmd_review(args) -> None:
     asyncio.run(main())
 
 
+def cmd_doctor(args) -> None:
+    from .health import run_checks
+
+    async def main():
+        settings = load_settings()
+        console.print("Checking data sources (takes up to ~15s)…\n")
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            checks = await run_checks(settings, client)
+        t = Table("", "Check", "Result", "How to fix")
+        for c in checks:
+            mark = "[green]✓[/]" if c.ok else ("[red]✗[/]" if c.required else "[yellow]![/]")
+            t.add_row(mark, c.name, c.detail, c.fix)
+        console.print(t)
+        bad = [c for c in checks if not c.ok and c.required]
+        if bad:
+            console.print(f"[red]{len(bad)} required check(s) failed; the dashboard will show NO BET until fixed.[/]")
+        else:
+            console.print("[green]Ready. Run `btcpredict` to start the dashboard.[/]")
+
+    asyncio.run(main())
+
+
+def _first_run_setup() -> None:
+    from pathlib import Path
+    import shutil
+
+    if not Path(".env").exists() and Path(".env.example").exists():
+        shutil.copy(".env.example", ".env")
+        console.print("[dim]Created .env from .env.example (edit it to change settings).[/]")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="btcpredict", description=__doc__)
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -193,6 +234,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--days", type=float, default=7)
     p.add_argument("--source", choices=["coinbase", "binance"])
     p.set_defaults(func=cmd_backtest)
+    sub.add_parser("doctor", help="check every data source and show fixes").set_defaults(func=cmd_doctor)
     sub.add_parser("review", help="paper-trading report from recorded snapshots").set_defaults(func=cmd_review)
 
     args = parser.parse_args(argv)
@@ -200,6 +242,11 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.INFO if args.verbose else logging.ERROR,
         filename="btcpredict.log" if (args.cmd in (None, "dashboard")) else None,
     )
+    if not args.verbose:
+        # websockets can trip an internal error when a connection drops mid-handshake;
+        # it is harmless (we reconnect) but asyncio would print the traceback.
+        logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+    _first_run_setup()
     (args.func if args.cmd else cmd_dashboard)(args)
 
 

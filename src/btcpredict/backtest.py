@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .data.prices import Candle
-from .model.probability import prob_up
+from .model.probability import norm_cdf, prob_up
 from .model.volatility import clamp_sigma, per_second_variance_from_closes
 from .model.windows import WINDOW_SECONDS
 
@@ -29,6 +29,8 @@ class Prediction:
     minute: int  # minutes elapsed when the prediction was made
     p_up: float
     outcome: int  # 1 if UP
+    log_ratio: float = 0.0  # ln(price / open)
+    scale: float = 0.0  # sigma * sqrt(seconds left)
 
 
 @dataclass(frozen=True)
@@ -73,8 +75,9 @@ def predict_windows(candles: Sequence[Candle]) -> list[Prediction]:
             if not var:
                 continue
             sigma = clamp_sigma(math.sqrt(var))
-            p = prob_up(bars[m - 1].close, open_px, sigma, (15 - m) * 60)
-            preds.append(Prediction(start, m, p, outcome))
+            price, tau = bars[m - 1].close, (15 - m) * 60
+            p = prob_up(price, open_px, sigma, tau)
+            preds.append(Prediction(start, m, p, outcome, math.log(price / open_px), sigma * math.sqrt(tau)))
     return preds
 
 
@@ -108,3 +111,32 @@ def evaluate(preds: Sequence[Prediction], n_bins: int = 10) -> Report:
                 )
             )
     return Report(len(windows), len(preds), up_rate, brier, 0.25, log_loss, by_minute, bins)
+
+
+def rescale(preds: Sequence[Prediction], vol_multiplier: float) -> list[Prediction]:
+    """Recompute P(UP) as if volatility were scaled by vol_multiplier."""
+    out = []
+    for p in preds:
+        s = p.scale * vol_multiplier
+        p_up = norm_cdf(p.log_ratio / s) if s > 0 else float(p.log_ratio >= 0)
+        out.append(Prediction(p.window_start, p.minute, p_up, p.outcome, p.log_ratio, p.scale))
+    return out
+
+
+def fit_vol_multiplier(preds: Sequence[Prediction], lo: float = 0.6, hi: float = 2.0, step: float = 0.05) -> float:
+    """Volatility scale that minimizes log loss on history. >1 means the raw model is overconfident
+    (e.g. fat tails), <1 means it is underconfident."""
+    best_k, best_loss = 1.0, float("inf")
+    k = lo
+    while k <= hi + 1e-9:
+        loss = evaluate(rescale(preds, k)).log_loss
+        if loss < best_loss:
+            best_k, best_loss = round(k, 2), loss
+        k += step
+    return best_k
+
+
+def max_calibration_gap(report: Report, min_n: int = 200) -> float:
+    """Largest |actual - predicted| across calibration bins with enough samples."""
+    gaps = [abs(b.hit_rate - b.mean_pred) for b in report.bins if b.n >= min_n]
+    return max(gaps, default=0.0)

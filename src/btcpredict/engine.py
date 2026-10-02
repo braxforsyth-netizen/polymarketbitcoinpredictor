@@ -39,6 +39,7 @@ class Snapshot:
     status: list[str] = field(default_factory=list)
     price_source: str = "exchange"
     open_source: str = "exchange"
+    validated: bool = False  # True once paper trading shows the model beats the market
 
     def to_dict(self) -> dict:
         """Plain-data view used by the AI agent tools and the recorder."""
@@ -69,6 +70,7 @@ class Snapshot:
                 for s in (r.quotes if r else ())
             },
             "high_impact_news_last_10m": self.shock,
+            "signal_validated_by_paper_trading": self.validated,
             "status": self.status,
         }
 
@@ -93,6 +95,11 @@ class Engine:
         self.cl_opens: dict[int, float] = {}
         self.basis: float | None = None  # EWMA of (Chainlink - exchange)
         self.cl_streaming = False
+        # Set by the calibration and validation loops
+        self.vol_multiplier = 1.0
+        self.blockers: dict[str, str] = {}  # reasons that force NO BET
+        self.validated = False
+        self.finals: dict[int, tuple[float, float, float]] = {}  # window -> (open, last price, seconds left)
         self.status: dict[str, str] = {}
 
     # ---------- setup ----------
@@ -222,8 +229,11 @@ class Engine:
         if price and open_px and sigma:
             proj = project(
                 price, open_px, sigma, left,
-                vol_multiplier=NEWS_SHOCK_VOL_MULTIPLIER if shock else 1.0,
+                vol_multiplier=self.vol_multiplier * (NEWS_SHOCK_VOL_MULTIPLIER if shock else 1.0),
             )
+            self.finals[w.start] = (open_px, price, left)
+            if len(self.finals) > 16:
+                del self.finals[min(self.finals)]
             quote = self.quote if self.quote and self.quote.market.slug == w.slug else None
             stale_quote = quote is not None and now - self.quote_ts > 10
             rec = recommend(
@@ -238,6 +248,7 @@ class Engine:
                 max_stake_fraction=self.s.max_stake_fraction,
                 min_seconds_left=self.s.min_seconds_left,
                 news_shock=shock,
+                blockers=list(self.blockers.values()),
             )
         elif open_px is None:
             status.append("waiting for window open price")
@@ -259,4 +270,5 @@ class Engine:
             status=status,
             price_source=price_src,
             open_source=open_src,
+            validated=self.validated,
         )

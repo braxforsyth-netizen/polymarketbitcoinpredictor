@@ -7,6 +7,7 @@ Kelly fraction for a binary contract bought at effective cost c: f* = (p - c) / 
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 
@@ -65,6 +66,7 @@ def recommend(
     min_seconds_left: float,
     news_shock: bool = False,
     max_disagreement: float = 0.25,
+    blockers: Sequence[str] = (),
 ) -> Recommendation:
     up = SideQuote("UP", p_up, ask_up, fee_per_share(ask_up, fee_rate) if ask_up is not None else 0.0)
     down = SideQuote(
@@ -72,9 +74,9 @@ def recommend(
     )
     quotes = (up, down)
 
-    reasons: list[str] = []
+    reasons: list[str] = list(blockers)
     if ask_up is None and ask_down is None:
-        return Recommendation("NO BET", ["No Polymarket prices available"], None, 0.0, quotes)
+        return Recommendation("NO BET", reasons + ["No Polymarket prices available"], None, 0.0, quotes)
     if seconds_left < min_seconds_left:
         reasons.append(f"Under {min_seconds_left:.0f}s left: latency/settlement-source risk")
     if news_shock:

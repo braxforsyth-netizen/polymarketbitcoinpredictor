@@ -73,7 +73,7 @@ async def test_engine_snapshot_end_to_end():
     json.dumps(d)  # serializable for the agent tools
     assert d["polymarket_up_ask"] == 0.55
 
-    console = Console(width=140, record=True, file=open("/dev/null", "w"))
+    console = Console(width=140, height=45, record=True, file=open("/dev/null", "w"))
     console.print(render(snap, engine.s, "Call: NO BET", time.time()))
     text = console.export_text()
     assert "BTC 15m Up/Down Advisor" in text and "ETF inflows" in text
